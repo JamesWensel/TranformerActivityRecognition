@@ -1,12 +1,22 @@
+#! /usr/bin/python3
+
 import os
+import sys
+import csv
 import cv2
-import math
 import time 
+import psutil
 import random
 import numpy as np
 
-# Get the names of all classes/categories in UCF101.
-all_classes_names = os.listdir('UCF101')
+from output import Output
+from output import printProgressBar
+
+# Create output object to store and output data
+output = Output(log_level=0)
+
+# Specify the directory containing the UCF101 dataset.
+DATASET_DIR = "UCF 101"
 
 # Specify the height and width to which each video frame will be resized in our dataset.
 IMAGE_HEIGHT , IMAGE_WIDTH = 224, 224
@@ -14,15 +24,23 @@ IMAGE_HEIGHT , IMAGE_WIDTH = 224, 224
 # Specify the number of frames of a video that will be fed to the model as one sequence.
 SEQUENCE_LENGTH = 20
 
-# Specify the directory containing the UCF101 dataset.
-DATASET_DIR = "UCF101"
+# Directory to output Processed Numpy Array to
+OUTPUT_DIR = "Total Dataset"
+
+# Define name for function to get mem info easier
+GET_MEM = psutil.Process(os.getpid()).memory_info
+
+# Record start time and memory of file
+output.add_data(time.time(), GET_MEM().rss)
+
+# Name of all classes in video directory
+all_classes_names = sorted(os.listdir(DATASET_DIR))
 
 # Specify the list containing the names of the classes used for training. Feel free to choose any set of classes.
-#CLASSES_LIST = all_classes_names
+CLASSES_LIST = all_classes_names
+#CLASSES_LIST = random.sample(all_classes_names, 50)
 #CLASSES_LIST = ["WalkingWithDog", "TaiChi", "Swing", "HorseRace"]
-#CLASSES_LIST = random.sample(all_classes_names, 20)
-CLASSES_LIST = np.load("class_list.npy").tolist()
-#np.save("class_list",np.array(CLASSES_LIST))
+#CLASSES_LIST = ["PushUps"]
 
 def frames_extraction(video_path):
     '''
@@ -34,7 +52,7 @@ def frames_extraction(video_path):
     '''
 
     # Declare a numpy array to store video frames.
-    frames_list = np.empty((0, 224, 224, 3), dtype='uint8')
+    frames_list = []
 
     # Read the Video File using the VideoCapture object.
     video_reader = cv2.VideoCapture(video_path)
@@ -63,12 +81,12 @@ def frames_extraction(video_path):
 
         # Convert the resized frame from int to float, then normalize by dividing by 255 so each pixel is between 0 
         # and 1, then finally add a dimension so it can be appended to frames_list 
-        # normalized_frame = np.divide(resized_frame.astype('float16'), 255)
-        normalized_frame = np.expand_dims(resized_frame, axis=0)
+        #normalized_frame = np.divide(resized_frame.astype('float16'), 255)
         
         # Append the normalized frame into the frames list
-        frames_list = np.append(frames_list, normalized_frame, axis=0)
-
+        #frames_list.append(normalized_frame)
+        frames_list.append(resized_frame)
+        
     # Release the VideoCapture object.
     video_reader.release()
 
@@ -76,7 +94,7 @@ def frames_extraction(video_path):
     return frames_list
 
 
-def create_dataset():
+def create_dataset(output):
     '''
     This function will extract the data of the selected classes and create the required dataset.
     Returns:
@@ -84,57 +102,141 @@ def create_dataset():
         labels:            A list containing the indexes of the classes associated with the videos.
         video_files_paths: A list containing the paths of the videos in the disk.
     '''
-    start = time.time()
     # Declared Empty Numpy Arrays to store the features, labels and List to store video file path values.
     features = []
     labels = []
     video_files_paths = []
-
+    
     # Iterating through all the classes mentioned in the classes list
     for class_index, class_name in enumerate(CLASSES_LIST):
 
         # Display the name of the class whose data is being extracted.
-        print(f'Extracting Data of Class: {class_name}')
+        if output.log_level > 1: 
+            print('Extracting Data of Class Number {}: {}'.format(class_index + 1, class_name))
+        
+        # Record start data for class_name
+        output.add_data(time.time(), GET_MEM().rss, identifier="  *  " + class_name)
 
         # Get the list of video files present in the specific class name directory.
         files_list = os.listdir(os.path.join(DATASET_DIR, class_name))
         
         # Iterate through all the files present in the files list.
-        for file_name in files_list:
-        
+        for i, file_name in enumerate(files_list):
             # Get the complete video path.
             video_file_path = os.path.join(DATASET_DIR, class_name, file_name)
             
             # Extract the frames of the video file.
             frames = frames_extraction(video_file_path)
             
-            
             # Check if the extracted frames are equal to the SEQUENCE_LENGTH specified above.
             # So ignore the vides having frames less than the SEQUENCE_LENGTH.
             if len(frames) == SEQUENCE_LENGTH:
-               
+            
                 # Append the data to their repective lists.
                 features.append(frames)
                 labels.append(class_index)
                 video_files_paths.append(video_file_path)
+                
+                # Print progress of current class
+                printProgressBar(i+1, len(files_list), prefix=class_name, suffix='Complete')
+                #break;
+                
+		# Print the current memory usage and timing statistics, and update csv values
+        output.add_data(time.time(), GET_MEM().rss, identifier="  *  " + class_name)
+        
+    # Records information before creating arrays 
+    output.add_data(time.time(), GET_MEM().rss, identifier='Array Creation')
     
-    print("Processing time: ", time.time() - start)  
-    #feat = np.memmap('test.npy', dtype='float16', mode='w+', shape=(len(features), 20, 224, 224, 3))
-    #feat[:] = features[:] 
-    #feat.flush() 
-    features = np.array(features) 
-    labels = np.array(labels)
+    if GET_MEM().rss / 1024**3 >= 60:        
+        # Create Memmep array to save processed video files. This is done to circumvent an issue with total ram. The system used to run
+        # this code has 125 GB of RAM. The data, after processing, can be 80-100 GB. This means the list used to store the frame data cannot
+        # be converted to a numpy array as numpy creates a copy in memory first, then copies the data, using more RAM than is available. Instead, 
+        # first write frame data to disk as a numpy memmap array, then delete the data stored in ram and reload the memmap into ram. 
+        
+        # Get initial timing data for writing to disk
+        output.add_data(time.time(), GET_MEM().rss, identifier='Write')
+        
+        # Create np.memmap array with correct shape to match our data. Save number of videos for reload
+        num_vids = len(features)
+        feat = np.memmap('temp.npy', dtype='uint8', mode='w+', shape=(num_vids, SEQUENCE_LENGTH, IMAGE_HEIGHT, IMAGE_WIDTH, 3))
+        
+        # Copy elements of features array to memory, Print to verify array shape
+        feat[:] = features[:] 
+        print("Memmap shape: {}".format(feat.shape))
+        
+        # Push data to Disk
+        feat.flush()
+        
+        # Print time used creating memmap array
+        output.add_data(time.time(), GET_MEM().rss, identifier='Write')
+        
+        # Delete all data in RAM and store data from the process
+        output.add_data(time.time(), GET_MEM().rss, identifier='Delete')
+        del features
+        del feat
+        output.add_data(time.time(), GET_MEM().rss, identifier='Delete')
+        
+        # Recording starting data for reloading the data array
+        output.add_data(time.time(), GET_MEM().rss, identifier='Reload')
+        
+        # Load memmap array. Will not immediately load into RAM, but when saved later will save entire memmap array as normal numpy array
+        # and will allow for loading entire dataset into RAM later. Print memory data and features shape to confirm loading
+        features = np.memmap('temp.npy', dtype='uint8', mode = 'r', shape=(num_vids, SEQUENCE_LENGTH, IMAGE_HEIGHT, IMAGE_WIDTH, 3))
+        print("Memmap shape: {}".format(features.shape))
+        
+        # Add final data entry for reloading 
+        output.add_data(time.time(), GET_MEM().rss, identifier='Reload')
     
-    print("Total time: ", time.time() - start)
+    else: 
+        # Create np array if there is enough memory for it
+        features = np.asarray(features, dtype='uint8') 
+        
+
+    # Print final memory and timing data
+    output.add_data(time.time(), GET_MEM().rss, identifier='Array Creation')
+    
     # Return the frames, class index, and video file path.
     return features, labels, video_files_paths
 
+# Add start data for creating the dataset
+output.add_data(time.time(), GET_MEM().rss, identifier='Create Dataset')
+
 # Create the dataset.
-features, labels, video_files_paths = create_dataset()
+features, labels, video_files_paths = create_dataset(output)
 
-np.save("features",features)
-np.save("labels",labels)
-np.save("video_file_paths", video_files_paths)
+# Add output data for creating the dataset
+output.add_data(time.time(), GET_MEM().rss, identifier='Create Dataset')
 
+# Print summary of processed array sizes 
+#f_size = sys.getsizeof(features) / 1024**3
+f_size = (features.size * features.itemsize) / 1024**3
+l_size = sys.getsizeof(labels) / 1024
+p_size = sys.getsizeof(video_files_paths) / 1024
+
+print("Numpy Array Sizes: ")
+print("    {}: {:.4f}GB".format("Features", f_size))
+print("    {}: {:.4f}KB".format("Labels", l_size))
+print("    {}: {:.4f}KB".format("Video File Paths", p_size))
+print("    {}: {:.4f}GB\n".format("Total size", f_size + (l_size / 1024**2) + (p_size / 1024**2)))
+
+# Print array shapes
 print("{} Shape: {}".format("Features", features.shape))
-print("{} Shape: {}\n".format("Labels", labels.shape))
+print("{} Shape: {}\n".format("Labels", (np.shape(labels))))
+
+# Add start data for numpy array saving
+output.add_data(time.time(), GET_MEM().rss, identifier='Save')
+
+# Save features, labels, and video_file_paths to OUTPUT_DIR
+np.save(os.path.join(OUTPUT_DIR, "features"), features)
+np.save(os.path.join(OUTPUT_DIR,"labels"), labels)
+np.save(os.path.join(OUTPUT_DIR,"video_file_paths"), video_files_paths)
+
+# If we created a temporary save array to clear space in RAM, delete it
+if os.path.exists("temp.npy"):
+    os.remove("temp.npy")
+
+# Add end data for numpy array saving
+output.add_data(time.time(), GET_MEM().rss, identifier='Save')
+
+# Add final data entry for end of Runtime
+output.add_data(time.time(), GET_MEM().rss, final='True', filename='Format_Time.csv', directory=OUTPUT_DIR)
